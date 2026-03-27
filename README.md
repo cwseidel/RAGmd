@@ -1,4 +1,3 @@
-````markdown
 # ragmd
 
 A command-line tool for exploring and curating project directories built around Markdown documents.
