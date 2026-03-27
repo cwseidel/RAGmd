@@ -52,9 +52,13 @@ git clone https://github.com/YOUR-USERNAME/ragmd.git
 cd ragmd
 ````
 
-Create a virtual environment (recommended):
+Create an environment using Conda. I used an environment I installed for [paper-qa](https://github.com/Future-House/paper-qa) from Future House, and the added the following things to it.
 
 ```bash
+pip install sentence-transformers faiss-cpu click rich openai
+```
+
+
 python -m venv .venv
 source .venv/bin/activate
 ```
