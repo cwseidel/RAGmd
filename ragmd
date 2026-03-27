@@ -209,7 +209,7 @@ def retrieve(query, top_k=TOP_K):
 
 def call_llm(prompt):
     # Optional: use OpenAI if key is present; otherwise None
-    api_key = os.environ.get("OPENAI_API_KEY", "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")
+    api_key = os.environ["OPENAI_API_KEY"]
     if not api_key:
         return None
     try:
