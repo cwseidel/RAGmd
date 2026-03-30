@@ -198,5 +198,4 @@ This is an evolving tool. Contributions, ideas, and feedback are welcome.
 
 ## License
 
-TBD
-
+This project is licensed under the MIT License.
