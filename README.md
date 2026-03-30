@@ -72,16 +72,14 @@ Create an environment using Conda. I used an environment I installed for [paper-
 pip install sentence-transformers faiss-cpu click rich openai
 ```
 
-
-python -m venv .venv
-source .venv/bin/activate
-```
-
-Install dependencies:
+It uses the API from openai, so you'll need an API key available as an environmental variable.
+You can enable this in your .bashrc file with the following line:
 
 ```bash
-pip install -r requirements.txt
+export OPENAI_API_KEY="put_your_key_here"
 ```
+
+It can work without the API, though it will be less helpful.
 
 ---
 
