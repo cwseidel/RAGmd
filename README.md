@@ -24,7 +24,7 @@ The goal is not just retrieval, but **understanding and improving your project d
 ## Key Features (Current / Planned)
 
 ### Core
-- Parse `.md` and `.Rmd` files
+- Parse `.md`, `.Rmd`, `.qmd`, `.org` files
 - Build a searchable index using embeddings
 - Query documents using natural language
 - Retrieve relevant sections with context
@@ -44,7 +44,7 @@ The goal is not just retrieval, but **understanding and improving your project d
 
 ## Example
 
-I have a project with a dozen markdown (*.md,*.Rmd) documents representing analysis I've been doing on and off for a year, and it's hard to tell what bits are in what documents. So I can just ask:
+I have a project with a dozen markdown (.md,.Rmd) documents representing analysis I've been doing on and off for a year, and it's hard to tell what bits are in what documents. So I can just ask:
 
 ```bash
 ragmd ask "Where do I calculate hysteresis peaks?"
@@ -120,7 +120,7 @@ ragmd ask "Are there any missing pieces in this analysis?"
 
 1. **Document Parsing**
 
-   * Reads `.md` and `.Rmd` files in the directory
+   * Reads `.md` and `.Rmd` files in the directory (also reads *.org and *.qmd)
 
 2. **Chunking**
 

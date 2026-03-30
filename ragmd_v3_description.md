@@ -56,9 +56,9 @@ ragmd ask "What are the open biological questions in this project?"
 
 ## Why this works well for “narrative curation”
 
- - Role-aware answers: every ask now uses your persona/voice.
+ - Role-aware answers: every ask uses your persona/voice.
  - Objective structure: the rubric enforces purpose, question, methods, results, narrative, provenance, next steps.
  - Actionable output: sidecar reports or inline TODOs keep momentum.
- - Offline fallback: even without an API key you get a useful checklist.
+ - Offline fallback: without an API key you still get a useful checklist.
 
 
