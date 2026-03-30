@@ -29,7 +29,7 @@ The goal is not just retrieval, but **understanding and improving your project d
 - Query documents using natural language
 - Retrieve relevant sections with context
 
-### Curation Assistant (Planned)
+### Curation Assistant
 - Detect missing or weak project documentation
 - Suggest improvements (e.g., purpose, hypotheses, narrative flow)
 - Encourage biologically meaningful questions
@@ -39,6 +39,21 @@ The goal is not just retrieval, but **understanding and improving your project d
 - Integrate with project-level YAML metadata
 - Understand relationships between projects
 - Surface connections across directories
+
+---
+
+## Example
+
+I have a project with a dozen markdown (*.md,*.Rmd) documents representing analysis I've been doing on and off for a year, and it's hard to tell what bits are in what documents. So I can just ask:
+
+```bash
+ragmd ask "Where do I calculate hysteresis peaks?"
+````
+
+Result:
+
+![Query Result](ragmd_ask.png)
+
 
 ---
 

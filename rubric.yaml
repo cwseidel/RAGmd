@@ -1,0 +1,18 @@
+checks:
+  - id: purpose
+    prompt: "Does the doc state its purpose in the first ~10 lines?"
+  - id: bio_question
+    prompt: "Are the biological question(s) explicit, testable, and scoped?"
+  - id: methods
+    prompt: "Is there a compact methods summary (tools, versions, key params)?"
+  - id: results
+    prompt: "Are main results/findings summarized in 3-7 bullet points?"
+  - id: narrative
+    prompt: "Is there a narrative arc (why → how → what → so-what/next)?"
+  - id: provenance
+    prompt: "Are data provenance and reproducibility details documented?"
+  - id: next_actions
+    prompt: "Are next steps listed with owners/dates (if known)?"
+  - id: biological_rigor
+    prompt: "Do claims tie to evidence (figures, stats, citations)?"
+ratings: ["missing","weak","ok","strong"]

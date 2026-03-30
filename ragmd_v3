@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+import os, sys, json, time, glob, re, hashlib, pathlib
+import click
+from rich.console import Console
+from rich.markdown import Markdown
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+from typing import Iterable
+import fnmatch
+import yaml
+
+# ---------- Config ----------
+INDEX_DIR = ".ragmd"
+CHUNK_SIZE = 1200        # characters
+CHUNK_OVERLAP = 200
+TOP_K = 6
+EMB_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # small, fast
+CACHE_DIR = os.path.join(INDEX_DIR, "cache")
+DEFAULT_EXTS = ("*.md", "*.Rmd", "*.qmd", "*.org")
+DEFAULT_IGNORES = {".git", ".hg", ".svn", ".ragmd", "node_modules", ".venv", "__pycache__"}
+# ----------------------------
+
+console = Console()
+
+#def md_files():
+#    return sorted([p for p in glob.glob("*.md") if os.path.isfile(p)])
+
+
+def load_rubric():
+    p = os.path.join(INDEX_DIR, "rubric.yaml")
+    if os.path.exists(p):
+        return yaml.safe_load(open(p, "r"))
+    return {"checks": [], "ratings": ["missing","weak","ok","strong"]}
+
+def curate_prompt(doc_text, file_path, rubric):
+    rubric_text = json.dumps(rubric, ensure_ascii=False)
+    return f"""You are auditing a single Markdown/Rmarkdown document.
+
+File: {file_path}
+
+Rubric (JSON):
+{rubric_text}
+
+Task:
+1) For each 'checks[i].id', assign a rating from rubric.ratings and a one-line justification.
+2) Suggest a brief improved INTRO section (<=120 words) if purpose or question are weak/missing.
+3) Suggest a 'Next steps' checklist (3-7 items, actionable).
+4) Return JSON ONLY with this schema:
+{{
+  "file": "...",
+  "scores": [{{"id":"...","rating":"...","note":"..."}} ...],
+  "intro_suggestion": "...",
+  "next_steps": ["...","..."]
+}}
+
+Here is the document content (fenced):
+```text
+{doc_text}
+```"""
+
+def quick_heuristic(doc_text):
+    head = "\n".join(doc_text.splitlines()[:25]).lower()
+    body = doc_text.lower()
+    def present(patterns, scope=head):
+        return any(re.search(p, scope) for p in patterns)
+    def rate(b): return "ok" if b else "missing"
+
+    return {
+      "scores": [
+        {"id":"purpose", "rating": rate(present([r"\bpurpose\b", r"\bgoal\b", r"\baim\b"])) , "note": "Looked for 'purpose/goal/aim' in first ~25 lines."},
+        {"id":"bio_question", "rating": rate(present([r"\bquestion\b", r"\bhypothesis\b"])) , "note": "Looked for 'question/hypothesis' near top."},
+        {"id":"methods", "rating": rate(present([r"\bmethods?\b", r"\bparameters?\b", r"\bversion\b", r"\bseurat\b|\bdeseq2\b|\bscanpy\b"], body)) , "note": "Looked for methods/tools/versions."},
+        {"id":"results", "rating": rate(present([r"\bresults?\b", r"\bfindings?\b", r"^-\s", r"^\*\s"], body)) , "note": "Looked for a results section or bullets."},
+        {"id":"narrative", "rating": rate(present([r"\bwhy\b.*\bhow\b.*\bwhat\b", r"\bintroduction\b|\bbackground\b"], body)) , "note": "Crude narrative signals."},
+        {"id":"provenance", "rating": rate(present([r"\bdata\b.*\bpath\b|\bprovenance\b|\bseed\b|\bcommit\b|\bgit\b|\bsnakemake\b"], body)) , "note": "Looked for data paths/seed/commit."},
+        {"id":"next_actions", "rating": rate(present([r"\bnext steps\b|\btodo\b|\baction items?\b"], body)) , "note": "Looked for explicit next steps."},
+      ],
+      "intro_suggestion": "",
+      "next_steps": []
+    }
+
+def ensure_cache_dir():
+    ensure_index_dir()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+def file_sig(path):
+    st = os.stat(path)
+    return f"{path}:{int(st.st_mtime)}:{st.st_size}"
+
+def cache_key(path):
+    h = hashlib.sha1(path.encode("utf-8")).hexdigest()
+    base = os.path.join(CACHE_DIR, h)
+    return {
+        "chunks": base + ".chunks.json",
+        "emb":    base + ".emb.npy",
+        "meta":   base + ".meta.json",
+    }
+
+def load_cached_file(path):
+    keys = cache_key(path)
+    if not (os.path.exists(keys["chunks"]) and os.path.exists(keys["emb"]) and os.path.exists(keys["meta"])):
+        return None, None
+    meta = json.load(open(keys["meta"]))
+    # back-compat: if 'path' missing, treat as stale
+    if meta.get("path") != os.path.abspath(path):
+        return None, None
+    if meta.get("sig") != file_sig(path):
+        return None, None
+    try:
+        chunks = json.load(open(keys["chunks"]))
+        embs = np.load(keys["emb"])
+        return chunks, embs
+    except Exception:
+        return None, None
+
+def save_cached_file(path, chunks, embs):
+    keys = cache_key(path)
+    json.dump(chunks, open(keys["chunks"], "w"))
+    np.save(keys["emb"], embs)
+    json.dump({"sig": file_sig(path), "path": os.path.abspath(path)}, open(keys["meta"], "w"))
+
+
+def _match_any(name: str, patterns: Iterable[str]) -> bool:
+    name_lower = name.lower()
+    return any(fnmatch.fnmatch(name_lower, p.lower()) for p in patterns)
+
+def md_files(root=".", recursive=False, exts=DEFAULT_EXTS, ignores=DEFAULT_IGNORES):
+    root = os.path.abspath(root)
+    out = []
+    if not recursive:
+        for f in os.listdir(root):
+            path = os.path.join(root, f)
+            if os.path.isfile(path) and _match_any(f, exts):
+                out.append(path)
+        return sorted(out)
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # prune ignored dirs
+        dirnames[:] = [d for d in dirnames if d not in ignores]
+        for f in filenames:
+            if _match_any(f, exts):
+                path = os.path.join(dirpath, f)
+                if os.path.isfile(path):
+                    out.append(path)
+    return sorted(out)
+    
+def file_sig(path):
+    st = os.stat(path)
+    return f"{path}:{int(st.st_mtime)}:{st.st_size}"
+
+def ensure_index_dir():
+    os.makedirs(INDEX_DIR, exist_ok=True)
+
+    
+def embed_texts(model, texts):
+    return model.encode(texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True)
+    
+def chunk_text(text, filename):
+    # Prefer splitting on headings; then window if needed.
+    sections = re.split(r"(?m)^#{1,6}\s+", text)
+    chunks = []
+    for sec in sections:
+        sec = sec.strip()
+        if not sec:
+            continue
+        # further windowing by chars
+        i = 0
+        while i < len(sec):
+            chunk = sec[i:i+CHUNK_SIZE]
+            chunks.append(chunk)
+            i += CHUNK_SIZE - CHUNK_OVERLAP
+    # attach simple titles from preceding headings for context
+    # (rough but effective)
+    lines = text.splitlines()
+    titles = []
+    for i,l in enumerate(lines):
+        if re.match(r"^#{1,6}\s+", l):
+            titles.append((i, l.strip("# ").strip()))
+    def nearest_title(pos):
+        prev = [t for t in titles if t[0] <= pos]
+        return prev[-1][1] if prev else pathlib.Path(filename).stem
+    out = []
+    pos = 0
+    for c in chunks:
+        # Find rough position to guess heading
+        snippet_start = text.find(c, pos)
+        title = nearest_title(snippet_start if snippet_start>=0 else pos)
+        out.append({"file": filename, "title": title, "text": c})
+        pos = (snippet_start + len(c)) if snippet_start>=0 else pos + len(c)
+    return out
+
+def build_corpus():
+    data = []
+    sigs = []
+    for f in md_files():
+        with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+            txt = fh.read()
+        ch = chunk_text(txt, f)
+        data.extend(ch)
+        sigs.append(file_sig(f))
+    return data, sigs
+
+def load_or_build_index(force=False, root=".", recursive=False, exts=DEFAULT_EXTS):
+    ensure_cache_dir()
+    meta_path = os.path.join(INDEX_DIR, "meta.json")
+    idx_path  = os.path.join(INDEX_DIR, "index.faiss")
+    map_path  = os.path.join(INDEX_DIR, "map.json")
+
+    files = md_files(root=root, recursive=recursive, exts=exts)
+    if not files:
+        raise SystemExit("No Markdown/Rmarkdown files found.")
+
+    current_sigs = [file_sig(f) for f in files]
+    if (not force and os.path.exists(meta_path) and os.path.exists(idx_path) and os.path.exists(map_path)):
+        meta = json.load(open(meta_path))
+        if meta.get("sigs") == current_sigs:
+            index = faiss.read_index(idx_path)
+            mapping = json.load(open(map_path))
+            return index, mapping
+
+    console.print("[bold]Indexing (incremental)...[/bold]")
+    model = SentenceTransformer(EMB_MODEL)
+
+    all_chunks = []
+    all_embs = []
+
+    for f in files:
+        chunks, embs = (None, None) if force else load_cached_file(f)
+        if chunks is None or embs is None:
+            with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+                txt = fh.read()
+            chunks = chunk_text(txt, f)
+            texts = [c["text"] for c in chunks]
+            embs = embed_texts(model, texts)
+            save_cached_file(f, chunks, embs)
+        all_chunks.extend(chunks)
+        all_embs.append(embs)
+
+    if not all_embs:
+        raise SystemExit("No content to index.")
+    embs = np.vstack(all_embs).astype("float32")
+
+    index = faiss.IndexFlatIP(embs.shape[1])
+    index.add(embs)
+
+    faiss.write_index(index, idx_path)
+    json.dump({"sigs": current_sigs, "emb_model": EMB_MODEL, "ts": time.time(), "root": os.path.abspath(root),
+               "recursive": bool(recursive), "exts": list(exts)}, open(meta_path, "w"))
+    json.dump(all_chunks, open(map_path, "w"))
+    return index, all_chunks
+
+def retrieve(query, top_k=TOP_K):
+    index, mapping = load_or_build_index(force=False)
+    model = SentenceTransformer(EMB_MODEL)
+    q = model.encode([query], normalize_embeddings=True)
+    D, I = index.search(q, top_k)
+    hits = []
+    for rank, (score, idx) in enumerate(zip(D[0], I[0]), start=1):
+        if idx == -1: continue
+        item = mapping[idx]
+        hits.append({"rank": rank, "score": float(score), **item})
+    return hits
+
+def load_role_prompt():
+    p = os.path.join(INDEX_DIR, "role.md")
+    if os.path.exists(p):
+        return open(p, "r", encoding="utf-8", errors="ignore").read()
+    # default minimal role
+    return ("You are a helpful, concise assistant. "
+            "Answer strictly from the provided context and rubric.")
+
+def call_llm(prompt, system_override=None):
+    api_key = os.environ["OPENAI_API_KEY"]
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        sys_prompt = system_override or load_role_prompt()
+        resp = client.chat.completions.create(
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role":"system","content":sys_prompt},
+                {"role":"user","content":prompt},
+            ],
+            temperature=0.1,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"(LLM call failed: {e})"
+
+def make_prompt(query, hits):
+    ctx_parts = []
+    for h in hits:
+        header = f"[{h['file']} :: {h['title']}]"
+        ctx_parts.append(header + "\n" + h["text"])
+    ctx = "\n\n---\n\n".join(ctx_parts)
+    return (
+        f"Context from local Markdown files:\n\n{ctx}\n\n"
+        f"Question: {query}\n\n"
+        "Answer concisely and cite files/sections like [file :: heading]."
+    )
+
+
+# helper for index settings
+def load_saved_index_settings():
+    meta_path = os.path.join(INDEX_DIR, "meta.json")
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        meta = json.load(open(meta_path))
+        return {
+            "root": meta.get("root", os.path.abspath(".")),
+            "recursive": bool(meta.get("recursive", False)),
+            "exts": tuple(meta.get("exts", list(DEFAULT_EXTS))),
+        }
+    except Exception:
+        return None
+
+def resolve_index_settings(root=None, recursive=None, exts=None):
+    saved = load_saved_index_settings()
+
+    # root
+    if root is None:
+        if saved:
+            root = saved["root"]
+        else:
+            root = "."
+
+    # recursive
+    if recursive is None:
+        if saved:
+            recursive = saved["recursive"]
+        else:
+            recursive = False
+
+    # exts
+    if exts:
+        effective_exts = DEFAULT_EXTS + tuple(exts)
+    elif saved:
+        effective_exts = tuple(saved["exts"])
+    else:
+        effective_exts = DEFAULT_EXTS
+
+    return root, recursive, effective_exts
+
+    
+@click.group(context_settings=dict(help_option_names=["-h","--help"]))
+def cli():
+    """ragmd: chat with the Markdown/Rmarkdown in your current directory (or subtree)."""
+    pass
+
+@cli.command()
+@click.option("--root", default=".", show_default=True, help="root directory to scan")
+@click.option("--recursive", is_flag=True, help="recurse into subdirectories")
+@click.option("--ext", "exts", multiple=True, help="extra glob(s) for file extensions, e.g. --ext '*.qmd'")
+def index(root, recursive, exts):
+    """Build or refresh the local index."""
+    # combine defaults with user-supplied exts
+    effective_exts = DEFAULT_EXTS + tuple(exts) if exts else DEFAULT_EXTS
+    load_or_build_index(force=True, root=root, recursive=recursive, exts=effective_exts)
+    console.print("[green]Index built.[/green]")
+
+@cli.command()
+@click.argument("question", nargs=-1)
+@click.option("--top-k", default=TOP_K, show_default=True, help="number of passages")
+@click.option("--no-llm", is_flag=True, help="skip LLM; show retrieved snippets only")
+@click.option("--root", default=None, help="root directory to scan")
+@click.option("--recursive", is_flag=True, default=None, help="recurse into subdirectories")
+@click.option("--ext", "exts", multiple=True, help="extra glob(s) for file extensions")
+def ask(question, top_k, no_llm, root, recursive, exts):
+    """Ask a question about your local Markdown/Rmarkdown."""
+    q = " ".join(question).strip()
+    if not q:
+        raise SystemExit('Provide a question, e.g. `ragmd ask "Where did I compute PCA?"`')
+
+    root, recursive, effective_exts = resolve_index_settings(root, recursive, exts)
+
+    index, mapping = load_or_build_index(
+        force=False,
+        root=root,
+        recursive=recursive,
+        exts=effective_exts
+    )
+
+    console.print(f"[dim]Using root={root}, recursive={recursive}[/dim]")
+
+    model = SentenceTransformer(EMB_MODEL)
+    D, I = index.search(model.encode([q], normalize_embeddings=True), top_k)
+
+    hits = []
+    for rank, (score, idx) in enumerate(zip(D[0], I[0]), start=1):
+        if idx == -1:
+            continue
+        item = mapping[idx]
+        hits.append({"rank": rank, "score": float(score), **item})
+
+    prompt = make_prompt(q, hits)
+
+    if no_llm:
+        console.rule("[bold]Top matches[/bold]")
+        for h in hits:
+            console.print(f"[{h['rank']}] {h['file']} :: {h['title']}  (score={h['score']:.3f})")
+            console.print(Markdown(h["text"].strip()[:1000] + ("..." if len(h["text"]) > 1000 else "")))
+            console.print("")
+        return
+
+    answer = call_llm(prompt)
+    if answer:
+        console.rule("[bold]Answer[/bold]")
+        console.print(Markdown(answer))
+        console.rule("[bold]Sources[/bold]")
+
+    for h in hits:
+        console.print(f"[{h['rank']}] {h['file']} :: {h['title']}  (score={h['score']:.3f})")
+        
+@cli.command()
+def vacuum():
+    """Remove cached vectors for files that no longer exist or moved; then rebuild index."""
+    ensure_cache_dir()
+    removed = 0
+    for fname in os.listdir(CACHE_DIR):
+        if not fname.endswith(".meta.json"):
+            continue
+        meta_path = os.path.join(CACHE_DIR, fname)
+        try:
+            meta = json.load(open(meta_path))
+            path = meta.get("path")
+        except Exception:
+            path = None
+        if (not path) or (not os.path.exists(path)):
+            # delete this cache bundle
+            base = meta_path[:-10]  # strip ".meta.json"
+            for ext in (".meta.json", ".chunks.json", ".emb.npy"):
+                f = base + ext
+                if os.path.exists(f):
+                    os.remove(f)
+            removed += 1
+    console.print(f"[green]Vacuum complete.[/green] Removed {removed} stale cache entr{'y' if removed==1 else 'ies'}.")
+
+@cli.command()
+@click.option("--root", default=None, help="root directory to scan")
+@click.option("--recursive", is_flag=True, default=None, help="recurse into subdirectories")
+@click.option("--ext", "exts", multiple=True)
+def stats(root, recursive, exts):
+    """Show basic index stats."""
+    root, recursive, effective_exts = resolve_index_settings(root, recursive, exts)
+    files = md_files(root=root, recursive=recursive, exts=effective_exts)
+    n_files = len(files)
+    n_cached = 0
+    n_chunks = 0
+    for f in files:
+        chunks, embs = load_cached_file(f)
+        if chunks is not None and embs is not None:
+            n_cached += 1
+            n_chunks += len(chunks)
+    console.print(f"Files discovered: {n_files}")
+    console.print(f"Files cached:     {n_cached}")
+    console.print(f"Total chunks:     {n_chunks} (cached)")
+
+# helper for curate command
+from collections import Counter, defaultdict
+
+def render_aggregate_report(results, rubric):
+    # results: list of dicts like {"file": ..., "scores": [...], "intro_suggestion": ..., "next_steps": [...]}
+    ids = [c["id"] for c in rubric.get("checks", [])]
+
+    # Count ratings by rubric item
+    by_check = {cid: Counter() for cid in ids}
+    weak_files = []
+
+    for r in results:
+        score_map = {s["id"]: s["rating"] for s in r.get("scores", [])}
+        weak_count = 0
+        for cid in ids:
+            rating = score_map.get(cid, "missing")
+            by_check[cid][rating] += 1
+            if rating in {"missing", "weak"}:
+                weak_count += 1
+        weak_files.append((weak_count, r["file"]))
+
+    weak_files.sort(reverse=True)
+
+    lines = []
+    lines.append("# Curation Aggregate Report")
+    lines.append("")
+    lines.append(f"Documents reviewed: **{len(results)}**")
+    lines.append("")
+
+    lines.append("## Overall rubric summary")
+    lines.append("")
+    lines.append("| Check | Missing | Weak | Ok | Strong |")
+    lines.append("|---|---:|---:|---:|---:|")
+    for cid in ids:
+        ctr = by_check[cid]
+        lines.append(
+            f"| {cid} | {ctr.get('missing',0)} | {ctr.get('weak',0)} | {ctr.get('ok',0)} | {ctr.get('strong',0)} |"
+        )
+    lines.append("")
+
+    lines.append("## Files needing most attention")
+    lines.append("")
+    lines.append("| File | Missing/Weak count |")
+    lines.append("|---|---:|")
+    for weak_count, fname in weak_files:
+        lines.append(f"| {fname} | {weak_count} |")
+    lines.append("")
+
+    lines.append("## Per-file summary")
+    lines.append("")
+    header = ["File"] + ids
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("|" + "|".join(["---"] * len(header)) + "|")
+    for r in results:
+        score_map = {s["id"]: s["rating"] for s in r.get("scores", [])}
+        row = [r["file"]] + [score_map.get(cid, "") for cid in ids]
+        lines.append("| " + " | ".join(row) + " |")
+    lines.append("")
+
+    lines.append("## Suggested intros and next steps")
+    lines.append("")
+    for r in results:
+        lines.append(f"### {r['file']}")
+        lines.append("")
+        if r.get("intro_suggestion"):
+            lines.append("**Suggested intro**")
+            lines.append("")
+            lines.append(r["intro_suggestion"])
+            lines.append("")
+        if r.get("next_steps"):
+            lines.append("**Next steps**")
+            lines.append("")
+            for n in r["next_steps"]:
+                lines.append(f"- {n}")
+            lines.append("")
+        if not r.get("intro_suggestion") and not r.get("next_steps"):
+            lines.append("_No suggestions generated._")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+@cli.command()
+@click.option("--write-suggestions", is_flag=True,
+              help="Write <file>.curation.md with scores + suggestions.")
+@click.option("--apply", is_flag=True,
+              help="Prepend a 'Curation TODOs' block to the file.")
+@click.option("--aggregate-report", default=None,
+              help="Write one combined markdown report.")
+@click.option("--root", default=None)
+@click.option("--recursive", is_flag=True, default=None)
+@click.option("--ext", "exts", multiple=True)
+def curate(write_suggestions, apply, aggregate_report, root, recursive, exts):
+    """Audit docs against rubric and suggest improvements."""
+    root, recursive, effective_exts = resolve_index_settings(root, recursive, exts)
+    files = md_files(root=root, recursive=recursive, exts=effective_exts)
+    
+    if not files:
+        console.print("[yellow]No documents found.[/yellow]")
+        return
+
+    rubric = load_rubric()
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    all_results = []
+
+    for f in files:
+        with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+            txt = fh.read()
+
+        result = None
+        if api_key:
+            p = curate_prompt(txt, f, rubric)
+            raw = call_llm(p) or ""
+            try:
+                result = json.loads(raw)
+            except Exception:
+                result = None
+
+        if result is None:
+            h = quick_heuristic(txt)
+            result = {"file": f, **h}
+
+        all_results.append(result)
+
+        console.rule(f"[bold]{f}[/bold]")
+        for s in result["scores"]:
+            console.print(f"[{s['id']}] {s['rating']}: {s.get('note','')}")
+        if result.get("intro_suggestion"):
+            console.print("\n[bold]Intro suggestion[/bold]\n" + result["intro_suggestion"])
+        if result.get("next_steps"):
+            console.print("\n[bold]Next steps[/bold]")
+            for n in result["next_steps"]:
+                console.print(f"- {n}")
+
+        if write_suggestions:
+            outp = f + ".curation.md"
+            with open(outp, "w", encoding="utf-8") as oh:
+                oh.write(f"# Curation for {f}\n\n")
+                oh.write("## Scores\n\n")
+                for s in result["scores"]:
+                    oh.write(f"- **{s['id']}**: {s['rating']} — {s.get('note','')}\n")
+                if result.get("intro_suggestion"):
+                    oh.write("\n## Suggested Intro\n\n" + result["intro_suggestion"] + "\n")
+                if result.get("next_steps"):
+                    oh.write("\n## Next Steps\n\n")
+                    for n in result["next_steps"]:
+                        oh.write(f"- {n}\n")
+
+        if apply:
+            todos = []
+            for s in result["scores"]:
+                if s["rating"] in {"missing", "weak"}:
+                    todos.append(f"[ ] Improve **{s['id']}** — {s.get('note','')}")
+            if result.get("next_steps"):
+                for n in result["next_steps"]:
+                    todos.append(f"[ ] {n}")
+            if todos:
+                block = "\n".join([
+                    "<!-- Curation TODOs (auto-generated by ragmd) -->",
+                    "### Curation TODOs",
+                    *todos,
+                    ""
+                ])
+                new_text = block + "\n" + txt
+                with open(f, "w", encoding="utf-8") as oh:
+                    oh.write(new_text)
+                console.print(f"[green]Applied TODOs to {f}[/green]")
+
+    if aggregate_report:
+        report_text = render_aggregate_report(all_results, rubric)
+        report_path = aggregate_report
+        report_dir = os.path.dirname(report_path)
+        if report_dir:
+            os.makedirs(report_dir, exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as oh:
+            oh.write(report_text)
+        console.print(f"\n[green]Aggregate report written to {report_path}[/green]")
+
+
+@cli.command()
+@click.option("--root", default=None, help="root directory to scan")
+@click.option("--recursive", is_flag=True, default=None, help="recurse into subdirectories")
+@click.option("--ext", "exts", multiple=True)
+def heatmap(root, recursive, exts):
+    """Show a heatmap of curation scores across documents."""
+    root, recursive, effective_exts = resolve_index_settings(root, recursive, exts)
+    files = md_files(root=root, recursive=recursive, exts=effective_exts)
+    rubric = load_rubric()
+
+    # map rating → emoji
+    sym = {
+        "strong": "🟢",
+        "ok": "🟡",
+        "weak": "🟡",
+        "missing": "🔴"
+    }
+
+    # collect scores
+    rows = []
+    for f in files:
+        chunks, _ = load_cached_file(f)
+        with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+            txt = fh.read()
+
+        # use heuristic for speed (or LLM if you want)
+        res = quick_heuristic(txt)
+
+        row = {"file": os.path.basename(f)}
+        for s in res["scores"]:
+            row[s["id"]] = sym.get(s["rating"], "?")
+        rows.append(row)
+
+    # print table
+    headers = ["file"] + [c["id"] for c in rubric["checks"]]
+    console.print(" | ".join(headers))
+    console.print("-" * 80)
+    for r in rows:
+        console.print(" | ".join(str(r.get(h, "")) for h in headers))
+
+@cli.command()
+def config():
+    """Show remembered index settings."""
+    saved = load_saved_index_settings()
+    if not saved:
+        console.print("[yellow]No saved index settings found.[/yellow]")
+        return
+    console.print(f"Root:       {saved['root']}")
+    console.print(f"Recursive:  {saved['recursive']}")
+    console.print(f"Extensions: {', '.join(saved['exts'])}")
+
+if __name__ == "__main__":
+    cli()
